@@ -15,8 +15,6 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.drop
-import kotlinx.coroutines.flow.collectLatest
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -58,16 +56,13 @@ class BourtsadorosViewModel(application: Application) : AndroidViewModel(applica
     private var playbackJob: Job? = null
     private var progressJob: Job? = null
 
-    // Loop data for gap‑free playback
-    private data class LoopData(
-        val pcmBytes: ByteArray,
-        val noteFrameOffsets: IntArray,
-        val totalFrames: Int
-    )
+    // Cache rendered chord by (rawResId, bpm)
+    private data class RenderedChord(val pcmBytes: ByteArray, val totalFrames: Int)
+    private val renderedChordCache = mutableMapOf<Pair<Int, Int>, RenderedChord>()
 
-    private var currentLoopData: LoopData? = null
-    private var nextLoopData: LoopData? = null
-    private var loopStartFrame: Int = 0
+    // Chunks in order they were written, for progress UI
+    private data class ChordChunk(val startFrame: Long, val frameCount: Int, val sequenceIndex: Int)
+    private val chunkQueue = ArrayDeque<ChordChunk>()
 
     init {
         try {
@@ -76,20 +71,10 @@ class BourtsadorosViewModel(application: Application) : AndroidViewModel(applica
                 val wav = WavLoader.load(app.resources, chord.rawResId)
                 wavCache[chord.rawResId] = wav.data
                 if (chord == chords.first()) firstRate = wav.sampleRate
-                Log.d("Bourtsadoros", "Loaded ${chord.name}, samples=${wav.data.size}, rate=${wav.sampleRate}")
             }
             sampleRate = firstRate
         } catch (e: Exception) {
             Log.e("Bourtsadoros", "WAV loading failed", e)
-        }
-
-        // Automatically restart playback when BPM changes while playing
-        viewModelScope.launch {
-            _bpm.drop(1).collectLatest {
-                if (_isPlaying.value) {
-                    restartPlayback()
-                }
-            }
         }
     }
 
@@ -100,154 +85,224 @@ class BourtsadorosViewModel(application: Application) : AndroidViewModel(applica
         }
     }
     fun clearSequence() { _sequence.value = emptyList() }
-    fun setBpm(newBpm: Int) { _bpm.value = newBpm.coerceIn(50, 200) }
+    fun setBpm(newBpm: Int) {
+        val coerced = newBpm.coerceIn(50, 200)
+        if (coerced == _bpm.value) return
+        _bpm.value = coerced
+        if (_isPlaying.value) restartPlayback()
+    }
     fun setLoopCount(count: Int) { _loopCount.value = count.coerceIn(1, 99) }
     fun toggleInfiniteLoop() {
         val wasInfinite = _infiniteLoop.value
         _infiniteLoop.value = !wasInfinite
         if (wasInfinite && _isPlaying.value) stopPlayback()
     }
+
     fun togglePlay() { if (_isPlaying.value) stopPlayback() else startPlayback() }
 
-    private fun restartPlayback() {
-        // Stop and restart after a tiny delay to avoid rapid changes
-        if (!_isPlaying.value) return
-        stopPlayback()
-        viewModelScope.launch {
-            delay(80)
-            if (!_isPlaying.value) startPlayback() // only restart if still not playing (will start)
-        }
+    private fun startPlayback() {
+        if (_sequence.value.isEmpty()) return
+        _isPlaying.value = true
+        _currentPlayingIndex.value = null
+        _progress.value = 0f
+        startPlaybackInternal()
     }
 
-    private fun startPlayback() {
-        val seq = _sequence.value
-        if (seq.isEmpty()) {
-            Log.d("Bourtsadoros", "Play pressed but sequence empty")
-            return
-        }
-        Log.d("Bourtsadoros", "Start playback, sequence=${seq.size}, bpm=${_bpm.value}")
+    private fun restartPlayback() {
+        val oldTrack = audioTrack
+        val oldPlay = playbackJob
+        val oldProg = progressJob
+        audioTrack = null
+        playbackJob = null
+        progressJob = null
+        oldPlay?.cancel()
+        oldProg?.cancel()
+        try { oldTrack?.pause() } catch (_: Exception) {}
+        try { oldTrack?.flush() } catch (_: Exception) {}
+        try { oldTrack?.release() } catch (_: Exception) {}
+        _currentPlayingIndex.value = null
+        _progress.value = 0f
+        // _isPlaying stays true
+        startPlaybackInternal()
+    }
 
-        _isPlaying.value = true
+    private fun startPlaybackInternal() {
+        val myQueue = ArrayDeque<ChordChunk>()
 
-        val bufferSize = AudioTrack.getMinBufferSize(
-            sampleRate,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-        val track = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build()
-            )
-            .setBufferSizeInBytes(bufferSize)
-            .build()
-        audioTrack = track
-        track.play()
-
-        // Pre‑build first two loops
-        currentLoopData = buildLoopData()
-        nextLoopData = buildLoopData()
-        loopStartFrame = 0
-
-        // Launch playback loop on Default dispatcher (blocking writes)
         playbackJob = viewModelScope.launch(Dispatchers.Default) {
+            val bufferSize = (sampleRate * 2).coerceAtLeast(16384)
+
+            val track = try {
+                AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(bufferSize)
+                    .build()
+            } catch (e: Exception) {
+                Log.e("Bourtsadoros", "AudioTrack build failed", e); null
+            }
+            if (track == null || !isActive) {
+                try { track?.release() } catch (_: Exception) {}
+                withContext(Dispatchers.Main) {
+                    if (audioTrack == null) _isPlaying.value = false
+                }
+                return@launch
+            }
+
+            val installed = withContext(Dispatchers.Main) {
+                if (_isPlaying.value && isActive && audioTrack == null) {
+                    audioTrack = track
+                    true
+                } else false
+            }
+            if (!installed) {
+                try { track.release() } catch (_: Exception) {}
+                return@launch
+            }
+
+            track.play()
+
             try {
-                val infinite = _infiniteLoop.value
-                var loopsRemaining = if (infinite) Int.MAX_VALUE else _loopCount.value
+                var writtenFrames = 0L
+                var position = 0
+                var loopsDone = 0
+                val maxLoops = if (_infiniteLoop.value) Int.MAX_VALUE else _loopCount.value
 
-                while (loopsRemaining > 0 && _isPlaying.value) {
-                    val data = currentLoopData ?: break
+                while (isActive && _isPlaying.value && loopsDone < maxLoops) {
+                    val seq = _sequence.value
+                    if (seq.isEmpty()) break
 
-                    // Pre‑build the loop after next asynchronously
-                    val futureBuild = launch {
-                        nextLoopData = buildLoopData()
+                    if (position >= seq.size) {
+                        position = 0
+                        loopsDone++
+                        if (loopsDone >= maxLoops) break
+                        continue
                     }
 
-                    // Write current loop to AudioTrack (blocking)
-                    track.write(data.pcmBytes, 0, data.pcmBytes.size)
-                    loopStartFrame += data.totalFrames
+                    val chordIndex = seq[position]
+                    val chord = chords.getOrNull(chordIndex)
+                    if (chord == null) { position++; continue }
 
-                    loopsRemaining--
-                    if (loopsRemaining <= 0 || !_isPlaying.value) break
+                    val rendered = try { renderChord(chord.rawResId, _bpm.value) } catch (e: Exception) {
+                        Log.e("Bourtsadoros", "render failed", e); null
+                    }
+                    if (rendered == null) { position++; continue }
 
-                    futureBuild.join()    // ensure next loop is ready
-                    // Swap buffers
-                    val temp = currentLoopData
-                    currentLoopData = nextLoopData
-                    nextLoopData = temp
+                    synchronized(myQueue) {
+                        myQueue.addLast(ChordChunk(writtenFrames, rendered.totalFrames, position))
+                        while (myQueue.size > 64) myQueue.removeFirst()
+                    }
+                    writtenFrames += rendered.totalFrames
+
+                    val bytes = rendered.pcmBytes
+                    var offset = 0
+                    val chunkSize = 4096
+                    while (offset < bytes.size && isActive && _isPlaying.value) {
+                        val toWrite = minOf(chunkSize, bytes.size - offset)
+                        val written = track.write(bytes, offset, toWrite)
+                        if (written <= 0) break
+                        offset += written
+                    }
+                    position++
                 }
             } catch (e: Exception) {
                 Log.e("Bourtsadoros", "Playback error", e)
             } finally {
-                // Safely clean up AudioTrack
-                try {
-                    track.stop()
-                } catch (_: Exception) {}
-                try {
-                    track.release()
-                } catch (_: Exception) {}
-                audioTrack = null
-                _currentPlayingIndex.value = null
-                _progress.value = 0f
-                _isPlaying.value = false
+                try { track.stop() } catch (_: Exception) {}
+                try { track.release() } catch (_: Exception) {}
+                synchronized(myQueue) { myQueue.clear() }
+                withContext(NonCancellable + Dispatchers.Main) {
+                    if (audioTrack === track) {
+                        audioTrack = null
+                        _currentPlayingIndex.value = null
+                        _progress.value = 0f
+                        _isPlaying.value = false
+                    }
+                }
             }
         }
 
-        // Progress updater
         progressJob = viewModelScope.launch {
             while (isActive && _isPlaying.value) {
-                updateProgress()
+                updateProgress(myQueue)
                 delay(50)
             }
         }
     }
 
-    private fun buildLoopData(): LoopData? {
-        val seq = _sequence.value
-        if (seq.isEmpty()) return null
+    private fun updateProgress(queue: ArrayDeque<ChordChunk>) {
+        val track = audioTrack ?: return
+        val head = track.playbackHeadPosition.toLong()
+        if (head < 0) return
 
-        val tempoRatio = _bpm.value / 120f
+        var chunk: ChordChunk? = null
+        synchronized(queue) {
+            while (queue.size > 1) {
+                val next = queue.elementAtOrNull(1) ?: break
+                if (next.startFrame <= head) queue.removeFirst() else break
+            }
+            chunk = queue.firstOrNull()
+        }
+        val c = chunk ?: return
+        if (head < c.startFrame) return
+
+        _currentPlayingIndex.value = c.sequenceIndex
+        val denom = c.frameCount.coerceAtLeast(1)
+        _progress.value = ((head - c.startFrame).toFloat() / denom).coerceIn(0f, 1f)
+    }
+
+    private fun renderChord(rawResId: Int, bpm: Int): RenderedChord? {
+        val key = rawResId to bpm
+        synchronized(renderedChordCache) {
+            renderedChordCache[key]?.let { return it }
+        }
+
+        val rawPcm = wavCache[rawResId] ?: return null
+        val tempoRatio = bpm / 120f
         val processor = SoundTouchProcessor()
-        processor.setSampleRate(sampleRate)
-        processor.setChannels(1)
-        processor.setTempo(tempoRatio)
-
-        val allProcessed = ArrayList<Float>()
-        val offsets = IntArray(seq.size)
-        var frameCount = 0
-
-        for ((i, chordIndex) in seq.withIndex()) {
-            val chord = chords.getOrNull(chordIndex) ?: continue
-            val rawPcm = wavCache[chord.rawResId] ?: continue
-            offsets[i] = frameCount
+        try {
+            processor.setSampleRate(sampleRate)
+            processor.setChannels(1)
+            processor.setTempo(tempoRatio)
             processor.putSamples(rawPcm)
+            processor.flush()
+
+            var out = FloatArray(8192)
+            var outSize = 0
+            val scratch = FloatArray(4096)
+            while (true) {
+                val received = processor.receiveSamplesInto(scratch)
+                if (received <= 0) break
+                if (outSize + received > out.size) {
+                    var newCap = out.size * 2
+                    while (newCap < outSize + received) newCap *= 2
+                    out = out.copyOf(newCap)
+                }
+                System.arraycopy(scratch, 0, out, outSize, received)
+                outSize += received
+            }
+            if (outSize == 0) return null
+
+            val result = RenderedChord(convertFloatTo16Bit(out.copyOf(outSize)), outSize)
+            synchronized(renderedChordCache) {
+                if (renderedChordCache.size > 64) renderedChordCache.clear()
+                renderedChordCache[key] = result
+            }
+            return result
+        } finally {
+            processor.destroy()
         }
-
-        processor.flush()   // <-- ADD THIS LINE
-
-        while (true) {
-            val chunk = processor.receiveSamples(4096)
-            if (chunk.isEmpty()) break
-            allProcessed.addAll(chunk.toList())
-            frameCount += chunk.size
-        }
-
-        processor.destroy()
-
-        if (allProcessed.isEmpty()) return null
-        val pcmBytes = convertFloatTo16Bit(allProcessed.toFloatArray())
-        val durationMs = (pcmBytes.size / 2).toLong() * 1000L / sampleRate
-        Log.d("Bourtsadoros", "Loop duration: ${durationMs}ms, tempoRatio=$tempoRatio")
-        return LoopData(pcmBytes, offsets, pcmBytes.size / 2)
     }
 
     private fun convertFloatTo16Bit(input: FloatArray): ByteArray {
@@ -260,47 +315,25 @@ class BourtsadorosViewModel(application: Application) : AndroidViewModel(applica
         return buffer
     }
 
-    private fun updateProgress() {
-        val track = audioTrack ?: return
-        val data = currentLoopData ?: return
-        val offsets = data.noteFrameOffsets
-        if (offsets.isEmpty()) return
-
-        val currentHead = track.playbackHeadPosition
-        // Relative position inside the loop (handle wrap)
-        val loopRelativeHead = (currentHead - loopStartFrame).let {
-            if (it < 0) it + Int.MAX_VALUE else it
-        }.toInt()
-
-        var index = -1
-        for (i in offsets.indices) {
-            if (loopRelativeHead >= offsets[i]) {
-                index = i
-            } else break
-        }
-        if (index >= 0 && index < offsets.size) {
-            _currentPlayingIndex.value = index
-            val noteStart = offsets[index]
-            val noteEnd = if (index + 1 < offsets.size) offsets[index + 1] else data.totalFrames
-            val noteProgress = ((loopRelativeHead - noteStart).toFloat() / (noteEnd - noteStart)).coerceIn(0f, 1f)
-            _progress.value = noteProgress
-        }
-    }
 
     private fun stopPlayback() {
-        // Just cancel the coroutines; the finally block will clean up AudioTrack
+        if (!_isPlaying.value) return
+        val track = audioTrack
+        audioTrack = null
         playbackJob?.cancel()
         progressJob?.cancel()
         playbackJob = null
         progressJob = null
-        // Do not touch audioTrack here – let the coroutine finally handle it
+        try { track?.pause() } catch (_: Exception) {}
+        try { track?.flush() } catch (_: Exception) {}
+        try { track?.release() } catch (_: Exception) {}
+        _isPlaying.value = false
+        _currentPlayingIndex.value = null
+        _progress.value = 0f
     }
 
     override fun onCleared() {
         super.onCleared()
-        playbackJob?.cancel()
-        progressJob?.cancel()
-        audioTrack?.release()
-        audioTrack = null
+        stopPlayback()
     }
 }

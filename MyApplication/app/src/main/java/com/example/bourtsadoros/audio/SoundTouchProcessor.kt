@@ -18,6 +18,9 @@ class SoundTouchProcessor {
         val received = receiveSamples(handle, out, bufferSize)
         return if (received > 0) out.copyOf(received) else floatArrayOf()
     }
+    fun receiveSamplesInto(output: FloatArray): Int {
+        return receiveSamples(handle, output, output.size)
+    }
     fun destroy() { destroyInstance(handle); handle = 0 }
 
     private external fun createInstance(): Long
